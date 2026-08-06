@@ -1,0 +1,150 @@
+---
+title: "From three disagreeing sources to one patient-count estimate"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{From three disagreeing sources to one patient-count estimate}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE, comment = "#>", fig.width = 6.5, fig.height = 4
+)
+has_ggplot2 <- requireNamespace("ggplot2", quietly = TRUE)
+```
+
+## The problem this package is for
+
+A recruiter, a client, or a health ministry rarely wants a rate. They want a
+number of people: how many patients have this condition, in this region,
+this year, and in five years. Getting there from public data usually means
+reconciling two or three sources that do not quite agree -- a household
+survey, an administrative registry, a model-based estimate -- and being
+honest about how much that disagreement should widen the final interval.
+
+This vignette walks the whole pipeline on a **synthetic** dataset shaped
+like that problem: six fictional regions, an age-stratified population for
+each, and three independent prevalence estimates per region for a fictional
+chronic condition. None of the numbers below describe a real disease,
+country, or published estimate -- swap `simulate_burden_example()` for real
+WHO/IHME/national-survey exports that share the same column names and
+everything downstream works unchanged.
+
+```{r setup}
+library(popburden)
+
+d <- simulate_burden_example()
+head(d$population)
+d$sources
+```
+
+## Step 1: reconcile the sources, region by region
+
+Each region has three prevalence estimates that disagree by design --
+`administrative_registry` runs low (registries undercount), the others
+cluster closer to the truth. `reconcile_estimates()` pools them with
+inverse-variance weights and, by default, lets the between-source spread
+inflate the pooled interval (DerSimonian-Laird random effects) rather than
+pretending three different measurement processes share one error model.
+
+```{r}
+regions <- unique(d$sources$region)
+
+reconciled <- lapply(regions, function(r) {
+  s <- d$sources[d$sources$region == r, ]
+  reconcile_estimates(s$estimate, s$se, source = s$source)
+})
+names(reconciled) <- regions
+
+reconciled[["Region A"]]
+```
+
+```{r, eval = has_ggplot2, fig.alt = "Forest plot of three prevalence sources and their pooled estimate for Region A"}
+plot_reconciled(reconciled[["Region A"]])
+```
+
+## Step 2: turn the pooled rate into a patient count
+
+`estimate_population_count()` propagates the pooled rate's uncertainty
+through to an absolute count via Monte Carlo simulation, sampling from a
+Beta distribution so the simulated rate never leaves \[0, 1\].
+
+```{r}
+region_totals <- stats::aggregate(population ~ region, d$population, sum)
+
+pop_table <- do.call(rbind, lapply(regions, function(r) {
+  pooled <- reconciled[[r]]
+  pop <- region_totals$population[region_totals$region == r]
+  out <- estimate_population_count(
+    rate = pooled$estimate, rate_se = pooled$se,
+    population = pop, distribution = "beta"
+  )
+  out$region <- r
+  out
+}))
+pop_table[, c("region", "population", "rate", "sim_mean", "ci_low", "ci_high")]
+```
+
+That table is the deliverable: six regions, one reconciled prevalence and
+one patient-count estimate with an interval per region, instead of eighteen
+disagreeing numbers.
+
+## Step 3: age-standardize when regions differ in age structure
+
+Raw prevalence comparisons across regions can just reflect who is old,
+not how sick a region is. `age_standardize()` computes a directly
+standardized rate against whatever reference-population weights you
+supply, with two ways to get a confidence interval: a fast normal
+approximation, or a Poisson parametric bootstrap for when some strata have
+only a handful of events.
+
+```{r}
+strata <- data.frame(
+  age_band   = c("0-14", "15-44", "45-64", "65+"),
+  count      = c(3, 14, 52, 96),
+  population = c(180000, 260000, 110000, 54000)
+)
+# Illustrative equal weights; use a published reference population
+# (e.g. the WHO World Standard Population) for a real analysis.
+age_standardize(
+  strata$count, strata$population,
+  weight = c(0.25, 0.25, 0.25, 0.25), method = "bootstrap"
+)
+```
+
+## Step 4: project forward
+
+`project_forward()` is deliberately simple: it compounds a population
+growth assumption and a rate-trend assumption forward from a base-year
+count, with both assumptions allowed their own uncertainty. It is a
+starting point for a scenario conversation, not a replacement for a full
+demographic or claims-based forecast.
+
+```{r}
+national_base <- sum(pop_table$sim_mean)
+
+proj <- project_forward(
+  base_count = national_base, horizon_years = 5,
+  pop_growth = 0.008, pop_growth_sd = 0.002,
+  rate_trend = 0.015, rate_trend_sd = 0.01
+)
+proj
+```
+
+```{r, eval = has_ggplot2, fig.alt = "Fan chart of the projected national patient count over five years"}
+plot_projection(proj, base_year = 2026)
+```
+
+## Summary
+
+- `reconcile_estimates()` -- pool disagreeing source estimates, with
+  between-source heterogeneity reflected in the interval.
+- `age_standardize()` -- compare regions or years on a level age basis.
+- `estimate_population_count()` -- turn a rate into a patient count without
+  losing the uncertainty.
+- `project_forward()` -- extend a current estimate into a multi-year
+  scenario.
+
+Every function returns both a point estimate and an interval; none of them
+silently drop the uncertainty on the way to a headline number.
